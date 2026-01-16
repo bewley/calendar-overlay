@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Calendar Slots Picker",
+  "version": "1.0.0",
+  "description": "Select multiple time slots from Google Calendar and copy them formatted for emails",
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://calendar.google.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://calendar.google.com/*"],
+      "js": ["content.js"],
+      "css": ["content.css"]
+    }
+  ],
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "action": {
+    "default_title": "Calendar Slots Picker"
+  }
+}

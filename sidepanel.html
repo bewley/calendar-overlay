@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Calendar Slots Picker</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+      background: #f8f9fa;
+      color: #202124;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .container {
+      padding: 16px;
+      max-width: 100%;
+    }
+
+    header {
+      margin-bottom: 16px;
+    }
+
+    h1 {
+      font-size: 18px;
+      font-weight: 600;
+      color: #1a73e8;
+      margin-bottom: 4px;
+    }
+
+    .subtitle {
+      font-size: 12px;
+      color: #5f6368;
+    }
+
+    .controls {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 8px 16px;
+      border: none;
+      border-radius: 4px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background-color 0.2s, box-shadow 0.2s;
+    }
+
+    .btn-primary {
+      background: #1a73e8;
+      color: white;
+    }
+
+    .btn-primary:hover {
+      background: #1557b0;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+    }
+
+    .btn-primary.active {
+      background: #ea4335;
+    }
+
+    .btn-primary.active:hover {
+      background: #c5221f;
+    }
+
+    .btn-secondary {
+      background: white;
+      color: #5f6368;
+      border: 1px solid #dadce0;
+    }
+
+    .btn-secondary:hover {
+      background: #f1f3f4;
+    }
+
+    .btn-copy {
+      background: #34a853;
+      color: white;
+    }
+
+    .btn-copy:hover {
+      background: #2d8e47;
+    }
+
+    .btn-copy:disabled {
+      background: #dadce0;
+      color: #9aa0a6;
+      cursor: not-allowed;
+    }
+
+    .btn-icon {
+      width: 18px;
+      height: 18px;
+    }
+
+    .slots-section {
+      background: white;
+      border-radius: 8px;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+      overflow: hidden;
+    }
+
+    .slots-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 16px;
+      background: #f8f9fa;
+      border-bottom: 1px solid #e8eaed;
+    }
+
+    .slots-header h2 {
+      font-size: 14px;
+      font-weight: 500;
+      color: #202124;
+    }
+
+    .slot-count {
+      font-size: 12px;
+      color: #5f6368;
+      background: #e8eaed;
+      padding: 2px 8px;
+      border-radius: 12px;
+    }
+
+    .slots-list {
+      max-height: 300px;
+      overflow-y: auto;
+    }
+
+    .slot-item {
+      display: flex;
+      align-items: flex-start;
+      padding: 12px 16px;
+      border-bottom: 1px solid #f1f3f4;
+      transition: background-color 0.15s;
+    }
+
+    .slot-item:last-child {
+      border-bottom: none;
+    }
+
+    .slot-item:hover {
+      background: #f8f9fa;
+    }
+
+    .slot-info {
+      flex: 1;
+    }
+
+    .slot-date {
+      font-weight: 500;
+      color: #202124;
+      margin-bottom: 2px;
+    }
+
+    .slot-time {
+      font-size: 13px;
+      color: #5f6368;
+    }
+
+    .slot-remove {
+      background: none;
+      border: none;
+      padding: 4px;
+      cursor: pointer;
+      color: #9aa0a6;
+      border-radius: 50%;
+      transition: background-color 0.15s, color 0.15s;
+    }
+
+    .slot-remove:hover {
+      background: #fce8e6;
+      color: #ea4335;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 32px 16px;
+      color: #5f6368;
+    }
+
+    .empty-state-icon {
+      font-size: 48px;
+      margin-bottom: 12px;
+      opacity: 0.5;
+    }
+
+    .empty-state p {
+      font-size: 13px;
+    }
+
+    .format-section {
+      margin-top: 16px;
+    }
+
+    .format-section h3 {
+      font-size: 13px;
+      font-weight: 500;
+      color: #5f6368;
+      margin-bottom: 8px;
+    }
+
+    .format-options {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .format-option {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+    }
+
+    .format-option input[type="radio"] {
+      accent-color: #1a73e8;
+    }
+
+    .format-option label {
+      font-size: 13px;
+      color: #202124;
+      cursor: pointer;
+    }
+
+    .preview-section {
+      margin-top: 16px;
+      background: white;
+      border-radius: 8px;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+      overflow: hidden;
+    }
+
+    .preview-header {
+      padding: 12px 16px;
+      background: #f8f9fa;
+      border-bottom: 1px solid #e8eaed;
+      font-size: 13px;
+      font-weight: 500;
+      color: #5f6368;
+    }
+
+    .preview-content {
+      padding: 12px 16px;
+      font-size: 13px;
+      white-space: pre-wrap;
+      font-family: inherit;
+      color: #202124;
+      background: #fafafa;
+      max-height: 150px;
+      overflow-y: auto;
+    }
+
+    .copy-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 16px;
+    }
+
+    .copy-actions .btn {
+      flex: 1;
+    }
+
+    .toast {
+      position: fixed;
+      bottom: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #323232;
+      color: white;
+      padding: 12px 24px;
+      border-radius: 4px;
+      font-size: 14px;
+      opacity: 0;
+      transition: opacity 0.3s;
+      z-index: 1000;
+    }
+
+    .toast.show {
+      opacity: 1;
+    }
+
+    .status-indicator {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      background: #e8f0fe;
+      border-radius: 4px;
+      margin-bottom: 16px;
+      font-size: 13px;
+      color: #1967d2;
+    }
+
+    .status-indicator.active {
+      background: #fce8e6;
+      color: #c5221f;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #1a73e8;
+    }
+
+    .status-indicator.active .status-dot {
+      background: #ea4335;
+      animation: pulse 1.5s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    .keyboard-hint {
+      font-size: 11px;
+      color: #9aa0a6;
+      margin-top: 4px;
+    }
+
+    kbd {
+      background: #f1f3f4;
+      border: 1px solid #dadce0;
+      border-radius: 3px;
+      padding: 1px 5px;
+      font-family: monospace;
+      font-size: 11px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Calendar Slots Picker</h1>
+      <p class="subtitle">Select time slots and copy for email</p>
+    </header>
+
+    <div id="statusIndicator" class="status-indicator">
+      <span class="status-dot"></span>
+      <span id="statusText">Selection mode is off</span>
+    </div>
+
+    <div class="controls">
+      <button id="toggleBtn" class="btn btn-primary">
+        <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>
+        </svg>
+        <span id="toggleBtnText">Start Selecting</span>
+      </button>
+      <button id="clearBtn" class="btn btn-secondary" title="Clear all selections">
+        <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/>
+        </svg>
+      </button>
+    </div>
+
+    <p class="keyboard-hint">Tip: Press <kbd>Alt</kbd> + <kbd>S</kbd> to toggle, <kbd>Esc</kbd> to exit</p>
+
+    <div class="slots-section">
+      <div class="slots-header">
+        <h2>Selected Slots</h2>
+        <span id="slotCount" class="slot-count">0</span>
+      </div>
+      <div id="slotsList" class="slots-list">
+        <div id="emptyState" class="empty-state">
+          <div class="empty-state-icon">&#128197;</div>
+          <p>No time slots selected yet.<br>Click "Start Selecting" and click on calendar slots.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="format-section">
+      <h3>Output Format</h3>
+      <div class="format-options">
+        <div class="format-option">
+          <input type="radio" id="formatBullet" name="format" value="bullet" checked>
+          <label for="formatBullet">Bullet list</label>
+        </div>
+        <div class="format-option">
+          <input type="radio" id="formatNumbered" name="format" value="numbered">
+          <label for="formatNumbered">Numbered list</label>
+        </div>
+        <div class="format-option">
+          <input type="radio" id="formatProse" name="format" value="prose">
+          <label for="formatProse">Prose (sentence)</label>
+        </div>
+      </div>
+    </div>
+
+    <div id="previewSection" class="preview-section" style="display: none;">
+      <div class="preview-header">Preview</div>
+      <div id="previewContent" class="preview-content"></div>
+    </div>
+
+    <div class="copy-actions">
+      <button id="copyBtn" class="btn btn-copy" disabled>
+        <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+          <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+        </svg>
+        Copy to Clipboard
+      </button>
+    </div>
+
+    <div id="toast" class="toast">Copied to clipboard!</div>
+  </div>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>
