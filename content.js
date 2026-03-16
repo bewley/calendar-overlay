@@ -1,476 +1,566 @@
 // Calendar Slots Picker - Content Script
-// Runs on Google Calendar pages to enable time slot selection
+// Intercepts mouse events on Google Calendar via a capture overlay
 
-(function() {
+(function () {
   'use strict';
 
-  // Store selected time slots
-  let selectedSlots = [];
-  let isSelectionMode = false;
-  let selectionOverlay = null;
+  const state = {
+    slots: [],
+    isActive: false,
+    drag: null,          // { startMin, endMin, date, clientX }
+    overlay: null,       // the fixed capture div
+    scrollContainer: null,
+    timeAxis: null,      // { labels:[{clientY, totalMinutes}], pxPerMin }
+    dayColumns: null,    // [{clientX, width, date}]
+    highlights: new Map(), // slotId -> HTMLElement
+  };
 
-  // Initialize the extension
-  function init() {
-    createSelectionOverlay();
-    setupEventListeners();
-    listenForMessages();
-    console.log('Calendar Slots Picker initialized');
+  // ── DOM Detection ────────────────────────────────────────────────
+
+  // Walk ALL elements looking for short text matching "1 AM", "2 PM", etc.
+  function findTimeLabels() {
+    const pattern = /^(1[0-2]|[1-9])\s*(AM|PM)$/i;
+    const results = [];
+
+    document.querySelectorAll('*').forEach(el => {
+      // Only look at leaf-ish nodes
+      if (el.children.length > 2) return;
+      const text = (el.innerText || el.textContent || '').trim();
+      if (!pattern.test(text)) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return;
+
+      const m = text.match(pattern);
+      let h = parseInt(m[1], 10);
+      const pm = m[2].toUpperCase() === 'PM';
+      if (pm && h !== 12) h += 12;
+      if (!pm && h === 12) h = 0;
+
+      results.push({ el, totalMinutes: h * 60, clientY: rect.top + rect.height / 2 });
+    });
+
+    results.sort((a, b) => a.clientY - b.clientY);
+    // Deduplicate by totalMinutes (keep first occurrence per hour)
+    const seen = new Set();
+    return results.filter(r => {
+      if (seen.has(r.totalMinutes)) return false;
+      seen.add(r.totalMinutes);
+      return true;
+    });
   }
 
-  // Create a visual overlay for selection feedback
-  function createSelectionOverlay() {
-    selectionOverlay = document.createElement('div');
-    selectionOverlay.id = 'csp-selection-overlay';
-    selectionOverlay.innerHTML = `
-      <div class="csp-status-bar">
-        <span class="csp-status-text">Click on time slots to select them</span>
-        <span class="csp-slot-count">0 slots selected</span>
-      </div>
-    `;
-    selectionOverlay.style.display = 'none';
-    document.body.appendChild(selectionOverlay);
-  }
+  function findScrollContainer() {
+    const labels = findTimeLabels();
+    if (!labels.length) return null;
 
-  // Update the status bar
-  function updateStatusBar() {
-    const countEl = selectionOverlay.querySelector('.csp-slot-count');
-    if (countEl) {
-      const count = selectedSlots.length;
-      countEl.textContent = `${count} slot${count !== 1 ? 's' : ''} selected`;
-    }
-  }
-
-  // Toggle selection mode
-  function toggleSelectionMode(enabled) {
-    isSelectionMode = enabled;
-    if (selectionOverlay) {
-      selectionOverlay.style.display = enabled ? 'block' : 'none';
-    }
-    document.body.classList.toggle('csp-selection-active', enabled);
-
-    if (enabled) {
-      // Prevent default calendar interactions
-      document.addEventListener('click', handleCalendarClick, true);
-    } else {
-      document.removeEventListener('click', handleCalendarClick, true);
-    }
-  }
-
-  // Parse time from various formats
-  function parseTimeString(timeStr) {
-    if (!timeStr) return null;
-
-    // Clean up the string
-    timeStr = timeStr.trim().toLowerCase();
-
-    // Match patterns like "9:00am", "9am", "14:00", "2:30pm"
-    const timeMatch = timeStr.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
-    if (!timeMatch) return null;
-
-    let hours = parseInt(timeMatch[1], 10);
-    const minutes = timeMatch[2] ? parseInt(timeMatch[2], 10) : 0;
-    const meridiem = timeMatch[3]?.toLowerCase();
-
-    if (meridiem === 'pm' && hours !== 12) hours += 12;
-    if (meridiem === 'am' && hours === 12) hours = 0;
-
-    return { hours, minutes };
-  }
-
-  // Format time for display
-  function formatTime(hours, minutes) {
-    const meridiem = hours >= 12 ? 'PM' : 'AM';
-    const displayHours = hours % 12 || 12;
-    const displayMinutes = minutes.toString().padStart(2, '0');
-    return `${displayHours}:${displayMinutes} ${meridiem}`;
-  }
-
-  // Get the date from the calendar view
-  function getDateFromColumn(element) {
-    // Try to find the date header for this column
-    const columnIndex = getColumnIndex(element);
-
-    // Look for date headers in week/day view
-    const dateHeaders = document.querySelectorAll('[data-datekey], [data-date]');
-    for (const header of dateHeaders) {
-      const dateKey = header.getAttribute('data-datekey') || header.getAttribute('data-date');
-      if (dateKey) {
-        // Parse date from format like "20240115" or "2024-01-15"
-        const match = dateKey.match(/(\d{4})-?(\d{2})-?(\d{2})/);
-        if (match) {
-          return new Date(parseInt(match[1]), parseInt(match[2]) - 1, parseInt(match[3]));
-        }
+    // Walk up from the first label to find a scrollable ancestor that is
+    // wider than just the time column
+    let el = labels[0].el.parentElement;
+    while (el && el !== document.body) {
+      const s = getComputedStyle(el);
+      const isScrollable = s.overflowY === 'auto' || s.overflowY === 'scroll';
+      const rect = el.getBoundingClientRect();
+      if (isScrollable && rect.width > 200 && rect.height > 200) {
+        return el;
       }
+      el = el.parentElement;
     }
-
-    // Try to get date from column headers
-    const headers = document.querySelectorAll('[role="columnheader"]');
-    if (headers[columnIndex]) {
-      const headerText = headers[columnIndex].textContent;
-      return parseDateFromHeader(headerText);
-    }
-
-    // Fallback to current visible date
-    return getCurrentVisibleDate();
-  }
-
-  // Get column index for an element
-  function getColumnIndex(element) {
-    const gridCell = element.closest('[role="gridcell"]');
-    if (gridCell) {
-      const row = gridCell.parentElement;
-      return Array.from(row.children).indexOf(gridCell);
-    }
-    return 0;
-  }
-
-  // Parse date from header text like "Mon 15"
-  function parseDateFromHeader(headerText) {
-    const today = new Date();
-    const dayMatch = headerText.match(/\d+/);
-    if (dayMatch) {
-      const day = parseInt(dayMatch[0], 10);
-      const date = new Date(today.getFullYear(), today.getMonth(), day);
-      // Adjust if the day seems to be in the next/previous month
-      if (day < today.getDate() - 15) {
-        date.setMonth(date.getMonth() + 1);
-      } else if (day > today.getDate() + 15) {
-        date.setMonth(date.getMonth() - 1);
-      }
-      return date;
-    }
-    return today;
-  }
-
-  // Get currently visible date from calendar
-  function getCurrentVisibleDate() {
-    // Try to find date from URL
-    const urlMatch = window.location.href.match(/(\d{4})\/(\d{1,2})\/(\d{1,2})/);
-    if (urlMatch) {
-      return new Date(parseInt(urlMatch[1]), parseInt(urlMatch[2]) - 1, parseInt(urlMatch[3]));
-    }
-
-    // Try to find from the calendar header
-    const headerEl = document.querySelector('[data-view-heading]');
-    if (headerEl) {
-      const text = headerEl.textContent;
-      // Parse "January 2024" or "Jan 15, 2024" etc.
-      const parsed = new Date(text);
-      if (!isNaN(parsed.getTime())) {
-        return parsed;
-      }
-    }
-
-    return new Date();
-  }
-
-  // Extract time slot info from clicked element
-  function extractSlotInfo(element) {
-    let timeStart = null;
-    let timeEnd = null;
-    let date = null;
-
-    // Strategy 1: Check for time in data attributes
-    const dataTime = element.getAttribute('data-time') ||
-                     element.closest('[data-time]')?.getAttribute('data-time');
-    if (dataTime) {
-      timeStart = parseTimeString(dataTime);
-    }
-
-    // Strategy 2: Check aria-label for time info
-    const ariaLabel = element.getAttribute('aria-label') ||
-                      element.closest('[aria-label]')?.getAttribute('aria-label');
-    if (ariaLabel) {
-      // Parse time ranges like "9:00 AM – 10:00 AM"
-      const timeRange = ariaLabel.match(/(\d{1,2}(?::\d{2})?\s*(?:AM|PM)?)\s*[–-]\s*(\d{1,2}(?::\d{2})?\s*(?:AM|PM)?)/i);
-      if (timeRange) {
-        timeStart = parseTimeString(timeRange[1]);
-        timeEnd = parseTimeString(timeRange[2]);
-      } else {
-        // Single time
-        const singleTime = ariaLabel.match(/(\d{1,2}(?::\d{2})?\s*(?:AM|PM))/i);
-        if (singleTime) {
-          timeStart = parseTimeString(singleTime[1]);
-        }
-      }
-
-      // Try to extract date from aria-label
-      const dateMatch = ariaLabel.match(/(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)[,\s]+(\w+)\s+(\d{1,2})(?:[,\s]+(\d{4}))?/i);
-      if (dateMatch) {
-        const monthStr = dateMatch[1];
-        const day = parseInt(dateMatch[2], 10);
-        const year = dateMatch[3] ? parseInt(dateMatch[3], 10) : new Date().getFullYear();
-        const months = ['january', 'february', 'march', 'april', 'may', 'june',
-                       'july', 'august', 'september', 'october', 'november', 'december'];
-        const monthIndex = months.findIndex(m => m.startsWith(monthStr.toLowerCase()));
-        if (monthIndex !== -1) {
-          date = new Date(year, monthIndex, day);
-        }
-      }
-    }
-
-    // Strategy 3: Calculate time from vertical position in day/week view
-    if (!timeStart) {
-      const timeSlot = findTimeSlotFromPosition(element);
-      if (timeSlot) {
-        timeStart = timeSlot;
-      }
-    }
-
-    // Get date if not already found
-    if (!date) {
-      date = getDateFromColumn(element);
-    }
-
-    // Default end time to 30 minutes after start
-    if (timeStart && !timeEnd) {
-      let endMinutes = timeStart.minutes + 30;
-      let endHours = timeStart.hours;
-      if (endMinutes >= 60) {
-        endMinutes -= 60;
-        endHours += 1;
-      }
-      timeEnd = { hours: endHours, minutes: endMinutes };
-    }
-
-    if (timeStart && date) {
-      return {
-        id: generateSlotId(date, timeStart, timeEnd),
-        date: date,
-        startTime: timeStart,
-        endTime: timeEnd,
-        dateString: formatDate(date),
-        startTimeString: formatTime(timeStart.hours, timeStart.minutes),
-        endTimeString: timeEnd ? formatTime(timeEnd.hours, timeEnd.minutes) : null
-      };
-    }
-
     return null;
   }
 
-  // Find time from element position in the calendar grid
-  function findTimeSlotFromPosition(element) {
-    // Find the calendar grid container
-    const gridContainer = element.closest('[role="grid"], [role="main"]');
-    if (!gridContainer) return null;
+  function findDayColumns() {
+    const cols = [];
 
-    // Find time labels on the left side
-    const timeLabels = document.querySelectorAll('[data-time], [data-guidedhelpid="time_label"]');
+    // Strategy 1: role="columnheader" elements
+    document.querySelectorAll('[role="columnheader"]').forEach(el => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 30) return; // skip narrow time-axis cell
+      const date = extractDate(el);
+      if (date) cols.push({ clientX: rect.left, width: rect.width, date });
+    });
+    if (cols.length) return cols;
 
-    // Get element's vertical position
-    const rect = element.getBoundingClientRect();
-    const elementTop = rect.top;
+    // Strategy 2: elements with data-datekey / data-date
+    document.querySelectorAll('[data-datekey],[data-date]').forEach(el => {
+      const key = el.getAttribute('data-datekey') || el.getAttribute('data-date');
+      const m = key && key.match(/(\d{4})-?(\d{2})-?(\d{2})/);
+      if (!m) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 30) return;
+      cols.push({
+        clientX: rect.left,
+        width: rect.width,
+        date: new Date(+m[1], +m[2] - 1, +m[3]),
+      });
+    });
+    return cols;
+  }
 
-    // Find the closest time label
-    let closestTime = null;
-    let closestDistance = Infinity;
-
-    timeLabels.forEach(label => {
-      const labelRect = label.getBoundingClientRect();
-      const distance = Math.abs(labelRect.top - elementTop);
-      if (distance < closestDistance) {
-        closestDistance = distance;
-        const timeAttr = label.getAttribute('data-time') || label.textContent;
-        closestTime = parseTimeString(timeAttr);
+  function extractDate(el) {
+    // data attribute
+    const key = el.getAttribute('data-datekey') || el.getAttribute('data-date');
+    if (key) {
+      const m = key.match(/(\d{4})-?(\d{2})-?(\d{2})/);
+      if (m) return new Date(+m[1], +m[2] - 1, +m[3]);
+    }
+    // aria-label with day number
+    const label = el.getAttribute('aria-label') || el.textContent || '';
+    const numM = label.match(/\b(\d{1,2})\b/);
+    if (numM) {
+      const day = parseInt(numM[1], 10);
+      const today = new Date();
+      for (let offset = -14; offset <= 14; offset++) {
+        const cand = new Date(today);
+        cand.setDate(today.getDate() + offset);
+        if (cand.getDate() === day) return cand;
       }
-    });
+    }
+    return null;
+  }
 
-    // Fallback: estimate from row position
-    if (!closestTime) {
-      const row = element.closest('[role="row"]');
-      if (row) {
-        const allRows = document.querySelectorAll('[role="row"]');
-        const rowIndex = Array.from(allRows).indexOf(row);
-        // Assuming each row is 30 minutes, starting from midnight
-        const totalMinutes = rowIndex * 30;
-        closestTime = {
-          hours: Math.floor(totalMinutes / 60) % 24,
-          minutes: totalMinutes % 60
-        };
-      }
+  // ── Calibration ──────────────────────────────────────────────────
+
+  function calibrate() {
+    const labels = findTimeLabels();
+    if (labels.length < 2) return false;
+
+    const samples = [];
+    for (let i = 1; i < labels.length; i++) {
+      const dm = labels[i].totalMinutes - labels[i - 1].totalMinutes;
+      const dy = labels[i].clientY - labels[i - 1].clientY;
+      if (dm > 0 && dy > 0) samples.push(dy / dm);
+    }
+    const pxPerMin = samples.reduce((a, b) => a + b, 0) / samples.length;
+
+    state.timeAxis = { labels, pxPerMin };
+    state.dayColumns = findDayColumns();
+    return true;
+  }
+
+  function getTimeFromY(clientY) {
+    const { labels, pxPerMin } = state.timeAxis;
+    // Find nearest label
+    let best = labels[0];
+    for (const l of labels) {
+      if (Math.abs(l.clientY - clientY) < Math.abs(best.clientY - clientY)) best = l;
+    }
+    const deltaMins = (clientY - best.clientY) / pxPerMin;
+    // Snap to 15-minute intervals
+    const snapped = Math.round(deltaMins / 15) * 15;
+    return Math.max(0, Math.min(23 * 60 + 45, best.totalMinutes + snapped));
+  }
+
+  function getClientYFromTime(totalMinutes) {
+    const { labels, pxPerMin } = state.timeAxis;
+    const best = labels.reduce((a, b) =>
+      Math.abs(b.totalMinutes - totalMinutes) < Math.abs(a.totalMinutes - totalMinutes) ? b : a
+    );
+    return best.clientY + (totalMinutes - best.totalMinutes) * pxPerMin;
+  }
+
+  function getDateFromX(clientX) {
+    const cols = state.dayColumns;
+    if (!cols.length) return new Date();
+    return (
+      cols.find(c => clientX >= c.clientX && clientX < c.clientX + c.width) ||
+      cols.reduce((a, b) => {
+        const aMid = a.clientX + a.width / 2;
+        const bMid = b.clientX + b.width / 2;
+        return Math.abs(bMid - clientX) < Math.abs(aMid - clientX) ? b : a;
+      })
+    ).date;
+  }
+
+  // ── Overlay ──────────────────────────────────────────────────────
+
+  function buildOverlay() {
+    state.scrollContainer = findScrollContainer();
+    if (!state.scrollContainer) {
+      console.warn('CSP: could not find scroll container');
+      return false;
     }
 
-    return closestTime;
+    const overlay = document.createElement('div');
+    overlay.id = 'csp-capture-overlay';
+
+    overlay.addEventListener('mousedown', onMousedown);
+    overlay.addEventListener('mousemove', onMousemove);
+    overlay.addEventListener('mouseup', onMouseup);
+    overlay.addEventListener('mouseleave', onMouseleave);
+    overlay.addEventListener('wheel', onWheel, { passive: false });
+    overlay.addEventListener('contextmenu', e => e.preventDefault());
+
+    document.body.appendChild(overlay);
+    state.overlay = overlay;
+    positionOverlay();
+    return true;
   }
 
-  // Generate unique ID for a slot
-  function generateSlotId(date, startTime, endTime) {
-    const dateStr = date.toISOString().split('T')[0];
-    const startStr = `${startTime.hours.toString().padStart(2, '0')}${startTime.minutes.toString().padStart(2, '0')}`;
-    const endStr = endTime ? `${endTime.hours.toString().padStart(2, '0')}${endTime.minutes.toString().padStart(2, '0')}` : '';
-    return `${dateStr}-${startStr}-${endStr}`;
-  }
-
-  // Format date for display
-  function formatDate(date) {
-    const options = { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' };
-    return date.toLocaleDateString('en-US', options);
-  }
-
-  // Handle click on calendar
-  function handleCalendarClick(event) {
-    if (!isSelectionMode) return;
-
-    const target = event.target;
-
-    // Check if clicked on a valid calendar area
-    const isCalendarArea = target.closest('[role="grid"]') ||
-                          target.closest('[role="gridcell"]') ||
-                          target.closest('[data-eventid]') ||
-                          target.closest('.csp-selectable-slot');
-
-    if (!isCalendarArea) return;
-
-    event.preventDefault();
-    event.stopPropagation();
-
-    const slotInfo = extractSlotInfo(target);
-    if (slotInfo) {
-      toggleSlotSelection(slotInfo, target);
-    }
-  }
-
-  // Toggle selection of a time slot
-  function toggleSlotSelection(slotInfo, element) {
-    const existingIndex = selectedSlots.findIndex(s => s.id === slotInfo.id);
-
-    if (existingIndex !== -1) {
-      // Deselect
-      selectedSlots.splice(existingIndex, 1);
-      removeSelectionHighlight(slotInfo.id);
-    } else {
-      // Select
-      selectedSlots.push(slotInfo);
-      addSelectionHighlight(element, slotInfo.id);
-    }
-
-    // Sort slots by date and time
-    selectedSlots.sort((a, b) => {
-      const dateCompare = a.date - b.date;
-      if (dateCompare !== 0) return dateCompare;
-      const timeCompareStart = (a.startTime.hours * 60 + a.startTime.minutes) -
-                               (b.startTime.hours * 60 + b.startTime.minutes);
-      return timeCompareStart;
-    });
-
-    updateStatusBar();
-    notifySelectionChange();
-  }
-
-  // Add visual highlight to selected slot
-  function addSelectionHighlight(element, slotId) {
-    // Find the best element to highlight
-    let highlightTarget = element.closest('[role="gridcell"]') ||
-                         element.closest('[role="button"]') ||
-                         element;
-
-    // Create highlight overlay
-    const highlight = document.createElement('div');
-    highlight.className = 'csp-slot-highlight';
-    highlight.setAttribute('data-slot-id', slotId);
-
-    const rect = highlightTarget.getBoundingClientRect();
-    const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
-    const scrollLeft = window.pageXOffset || document.documentElement.scrollLeft;
-
-    highlight.style.position = 'absolute';
-    highlight.style.top = `${rect.top + scrollTop}px`;
-    highlight.style.left = `${rect.left + scrollLeft}px`;
-    highlight.style.width = `${rect.width}px`;
-    highlight.style.height = `${rect.height}px`;
-    highlight.style.pointerEvents = 'none';
-
-    document.body.appendChild(highlight);
-  }
-
-  // Remove highlight from deselected slot
-  function removeSelectionHighlight(slotId) {
-    const highlight = document.querySelector(`.csp-slot-highlight[data-slot-id="${slotId}"]`);
-    if (highlight) {
-      highlight.remove();
-    }
-  }
-
-  // Clear all selections
-  function clearAllSelections() {
-    selectedSlots = [];
-    document.querySelectorAll('.csp-slot-highlight').forEach(el => el.remove());
-    updateStatusBar();
-    notifySelectionChange();
-  }
-
-  // Notify side panel of selection changes
-  function notifySelectionChange() {
-    chrome.runtime.sendMessage({
-      type: 'SLOTS_UPDATED',
-      slots: selectedSlots
+  function positionOverlay() {
+    if (!state.overlay || !state.scrollContainer) return;
+    const rect = state.scrollContainer.getBoundingClientRect();
+    Object.assign(state.overlay.style, {
+      position: 'fixed',
+      top: rect.top + 'px',
+      left: rect.left + 'px',
+      width: rect.width + 'px',
+      height: rect.height + 'px',
+      zIndex: '999998',
+      cursor: 'crosshair',
+      background: 'transparent',
     });
   }
 
-  // Listen for messages from background/sidepanel
-  function listenForMessages() {
-    chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-      switch (message.type) {
-        case 'TOGGLE_SELECTION_MODE':
-          toggleSelectionMode(message.enabled);
-          sendResponse({ success: true, enabled: isSelectionMode });
-          break;
+  // ── Mouse Handlers ───────────────────────────────────────────────
 
-        case 'GET_SELECTED_SLOTS':
-          sendResponse({ slots: selectedSlots });
-          break;
+  function onMousedown(e) {
+    e.preventDefault();
+    e.stopPropagation();
 
-        case 'CLEAR_SELECTIONS':
-          clearAllSelections();
-          sendResponse({ success: true });
-          break;
+    calibrate();
 
-        case 'REMOVE_SLOT':
-          const index = selectedSlots.findIndex(s => s.id === message.slotId);
-          if (index !== -1) {
-            removeSelectionHighlight(message.slotId);
-            selectedSlots.splice(index, 1);
-            updateStatusBar();
-            notifySelectionChange();
-          }
-          sendResponse({ success: true });
-          break;
-      }
-      return true; // Keep message channel open for async response
-    });
-  }
+    const startMin = getTimeFromY(e.clientY);
+    const date = getDateFromX(e.clientX);
 
-  // Setup additional event listeners
-  function setupEventListeners() {
-    // Update highlights on scroll/resize
-    let updateTimeout;
-    const updateHighlights = () => {
-      clearTimeout(updateTimeout);
-      updateTimeout = setTimeout(() => {
-        document.querySelectorAll('.csp-slot-highlight').forEach(el => el.remove());
-        // Re-add highlights would require storing element references
-        // For now, clear and let user re-select if needed after major scroll
-      }, 200);
+    state.drag = {
+      startMin,
+      endMin: startMin + 60,
+      date,
+      clientX: e.clientX,
+      moved: false,
     };
 
-    window.addEventListener('scroll', updateHighlights, { passive: true });
-    window.addEventListener('resize', updateHighlights, { passive: true });
+    renderPreview();
+  }
 
-    // Keyboard shortcut to toggle selection mode (Alt+S)
-    document.addEventListener('keydown', (event) => {
-      if (event.altKey && event.key === 's') {
-        toggleSelectionMode(!isSelectionMode);
-        notifySelectionChange();
+  function onMousemove(e) {
+    if (!state.drag) return;
+    const newEnd = getTimeFromY(e.clientY);
+    if (newEnd > state.drag.startMin) {
+      state.drag.endMin = newEnd;
+      state.drag.moved = true;
+    }
+    state.drag.clientX = e.clientX;
+    renderPreview();
+  }
+
+  function onMouseup(e) {
+    if (!state.drag) return;
+    commitDrag();
+    state.drag = null;
+  }
+
+  function onMouseleave(e) {
+    if (state.drag) {
+      commitDrag();
+      state.drag = null;
+    }
+  }
+
+  function onWheel(e) {
+    e.preventDefault();
+    if (state.scrollContainer) {
+      state.scrollContainer.scrollTop += e.deltaY;
+    }
+    // Refresh highlight positions after scroll
+    requestAnimationFrame(refreshHighlights);
+  }
+
+  // ── Drag Preview ─────────────────────────────────────────────────
+
+  function renderPreview() {
+    if (!state.drag || !state.overlay) return;
+
+    let preview = state.overlay.querySelector('#csp-drag-preview');
+    if (!preview) {
+      preview = document.createElement('div');
+      preview.id = 'csp-drag-preview';
+      Object.assign(preview.style, {
+        position: 'absolute',
+        background: 'rgba(26, 115, 232, 0.35)',
+        border: '2px solid #1a73e8',
+        borderRadius: '4px',
+        pointerEvents: 'none',
+        padding: '3px 5px',
+        fontSize: '11px',
+        fontWeight: '600',
+        color: '#1a73e8',
+        overflow: 'hidden',
+        fontFamily: 'sans-serif',
+      });
+      state.overlay.appendChild(preview);
+    }
+
+    const pos = getSlotPosition(state.drag.date, state.drag.startMin, state.drag.endMin);
+    if (!pos) return;
+
+    Object.assign(preview.style, {
+      top: pos.top + 'px',
+      left: pos.left + 'px',
+      width: pos.width + 'px',
+      height: Math.max(18, pos.height) + 'px',
+    });
+    preview.textContent = `${fmtMin(state.drag.startMin)} – ${fmtMin(state.drag.endMin)}`;
+  }
+
+  function clearPreview() {
+    state.overlay?.querySelector('#csp-drag-preview')?.remove();
+  }
+
+  // ── Slot Management ──────────────────────────────────────────────
+
+  function commitDrag() {
+    clearPreview();
+    if (!state.drag) return;
+
+    let { startMin, endMin, date } = state.drag;
+
+    // If barely dragged, treat as a 30-min click
+    if (endMin - startMin < 15) endMin = startMin + 30;
+
+    const startTime = minsToTime(startMin);
+    const endTime = minsToTime(endMin);
+
+    const slot = {
+      id: `${date.toISOString().slice(0, 10)}-${startMin}-${endMin}`,
+      date,
+      startTime,
+      endTime,
+      dateString: fmtDate(date),
+      startTimeString: fmtTime(startTime.hours, startTime.minutes),
+      endTimeString: fmtTime(endTime.hours, endTime.minutes),
+    };
+
+    const idx = state.slots.findIndex(s => s.id === slot.id);
+    if (idx !== -1) {
+      state.slots.splice(idx, 1);
+      removeHighlight(slot.id);
+    } else {
+      state.slots.push(slot);
+      state.slots.sort((a, b) => {
+        const dd = a.date - b.date;
+        return dd !== 0 ? dd :
+          (a.startTime.hours * 60 + a.startTime.minutes) -
+          (b.startTime.hours * 60 + b.startTime.minutes);
+      });
+      addHighlight(slot);
+    }
+
+    notify();
+  }
+
+  function removeSlot(slotId) {
+    const idx = state.slots.findIndex(s => s.id === slotId);
+    if (idx !== -1) {
+      removeHighlight(slotId);
+      state.slots.splice(idx, 1);
+      notify();
+    }
+  }
+
+  function clearAll() {
+    state.slots = [];
+    state.highlights.forEach(el => el.remove());
+    state.highlights.clear();
+    notify();
+  }
+
+  // ── Highlights ───────────────────────────────────────────────────
+
+  function getSlotPosition(date, startMin, endMin) {
+    if (!state.timeAxis || !state.overlay) return null;
+    const overlayRect = state.overlay.getBoundingClientRect();
+    const startY = getClientYFromTime(startMin) - overlayRect.top;
+    const endY = getClientYFromTime(endMin) - overlayRect.top;
+    const height = Math.max(18, endY - startY);
+
+    const cols = state.dayColumns || [];
+    let left = 60, width = 80;
+
+    if (cols.length > 0) {
+      const col = date
+        ? cols.find(c =>
+            c.date.getFullYear() === date.getFullYear() &&
+            c.date.getMonth() === date.getMonth() &&
+            c.date.getDate() === date.getDate()
+          )
+        : null;
+      if (col) {
+        left = col.clientX - overlayRect.left + 2;
+        width = col.width - 4;
       }
-      // Escape to exit selection mode
-      if (event.key === 'Escape' && isSelectionMode) {
-        toggleSelectionMode(false);
-        notifySelectionChange();
-      }
+    }
+
+    return { top: startY, left, width, height };
+  }
+
+  function addHighlight(slot) {
+    if (!state.overlay || !state.timeAxis) return;
+
+    calibrate();
+    const startMin = slot.startTime.hours * 60 + slot.startTime.minutes;
+    const endMin = slot.endTime.hours * 60 + slot.endTime.minutes;
+    const pos = getSlotPosition(slot.date, startMin, endMin);
+    if (!pos) return;
+
+    const el = document.createElement('div');
+    el.className = 'csp-slot-highlight';
+    el.setAttribute('data-slot-id', slot.id);
+    Object.assign(el.style, {
+      position: 'absolute',
+      background: 'rgba(26, 115, 232, 0.25)',
+      border: '2px solid #1a73e8',
+      borderRadius: '4px',
+      pointerEvents: 'none',
+      padding: '2px 4px',
+      fontSize: '11px',
+      fontWeight: '600',
+      color: '#1a73e8',
+      overflow: 'hidden',
+      fontFamily: 'sans-serif',
+      boxShadow: '0 1px 3px rgba(26,115,232,0.3)',
+      top: pos.top + 'px',
+      left: pos.left + 'px',
+      width: pos.width + 'px',
+      height: pos.height + 'px',
+    });
+    el.textContent = `${slot.startTimeString} – ${slot.endTimeString}`;
+
+    state.highlights.set(slot.id, el);
+    state.overlay.appendChild(el);
+  }
+
+  function removeHighlight(slotId) {
+    const el = state.highlights.get(slotId);
+    if (el) { el.remove(); state.highlights.delete(slotId); }
+  }
+
+  function refreshHighlights() {
+    if (!state.overlay || !state.timeAxis) return;
+    calibrate();
+    const overlayRect = state.overlay.getBoundingClientRect();
+
+    state.highlights.forEach((el, slotId) => {
+      const slot = state.slots.find(s => s.id === slotId);
+      if (!slot) return;
+      const startMin = slot.startTime.hours * 60 + slot.startTime.minutes;
+      const endMin = slot.endTime.hours * 60 + slot.endTime.minutes;
+      const pos = getSlotPosition(slot.date, startMin, endMin);
+      if (!pos) return;
+
+      Object.assign(el.style, {
+        top: pos.top + 'px',
+        left: pos.left + 'px',
+        width: pos.width + 'px',
+        height: pos.height + 'px',
+      });
     });
   }
 
-  // Initialize when DOM is ready
+  // ── Utilities ────────────────────────────────────────────────────
+
+  function minsToTime(totalMins) {
+    return { hours: Math.floor(totalMins / 60), minutes: totalMins % 60 };
+  }
+
+  function fmtMin(totalMins) {
+    return fmtTime(Math.floor(totalMins / 60), totalMins % 60);
+  }
+
+  function fmtTime(h, m) {
+    const mer = h >= 12 ? 'PM' : 'AM';
+    return `${h % 12 || 12}:${String(m).padStart(2, '0')} ${mer}`;
+  }
+
+  function fmtDate(d) {
+    return d.toLocaleDateString('en-US', {
+      weekday: 'long', month: 'long', day: 'numeric', year: 'numeric',
+    });
+  }
+
+  function notify() {
+    chrome.runtime.sendMessage({ type: 'SLOTS_UPDATED', slots: state.slots })
+      .catch(() => {});
+  }
+
+  // ── Enable / Disable ─────────────────────────────────────────────
+
+  function enable() {
+    if (state.isActive) return;
+    if (!calibrate()) {
+      console.warn('CSP: Could not find time labels — are you in week/day view?');
+    }
+    if (!buildOverlay()) return;
+    state.isActive = true;
+
+    // Re-render any previously selected slots
+    state.slots.forEach(slot => addHighlight(slot));
+    document.body.classList.add('csp-selection-active');
+  }
+
+  function disable() {
+    if (!state.isActive) return;
+    state.isActive = false;
+    if (state.overlay) {
+      state.overlay.remove();
+      state.overlay = null;
+    }
+    state.highlights.clear();
+    document.body.classList.remove('csp-selection-active');
+  }
+
+  // ── Init ─────────────────────────────────────────────────────────
+
+  function init() {
+    chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
+      switch (msg.type) {
+        case 'TOGGLE_SELECTION_MODE':
+          msg.enabled ? enable() : disable();
+          respond({ success: true, enabled: state.isActive });
+          break;
+        case 'GET_SELECTED_SLOTS':
+          respond({ slots: state.slots });
+          break;
+        case 'CLEAR_SELECTIONS':
+          clearAll();
+          respond({ success: true });
+          break;
+        case 'REMOVE_SLOT':
+          removeSlot(msg.slotId);
+          respond({ success: true });
+          break;
+      }
+      return true;
+    });
+
+    document.addEventListener('keydown', e => {
+      if (e.altKey && e.key === 's') state.isActive ? disable() : enable();
+      if (e.key === 'Escape' && state.isActive) disable();
+    });
+
+    window.addEventListener('resize', () => {
+      positionOverlay();
+      requestAnimationFrame(refreshHighlights);
+    });
+
+    // Recalibrate when Google Calendar navigates (SPA)
+    let lastUrl = location.href;
+    new MutationObserver(() => {
+      if (location.href !== lastUrl) {
+        lastUrl = location.href;
+        setTimeout(() => {
+          calibrate();
+          if (state.isActive) {
+            positionOverlay();
+            refreshHighlights();
+          }
+        }, 600);
+      }
+    }).observe(document.body, { childList: true, subtree: true });
+
+    console.log('Calendar Slots Picker ready');
+  }
+
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
   } else {
