@@ -12,21 +12,13 @@
     isActive: false,
     drag: null,
     overlay: null,
-    scrollContainer: null,
+    gridBounds: null,   // {top, left, width, height} of the actual time grid
     timeAxis: null,
     dayColumns: null,
     highlights: new Map(),
   };
 
   // ── DOM Detection ────────────────────────────────────────────────
-
-  // Multiple patterns to match time labels in Google Calendar
-  const TIME_PATTERNS = [
-    /^(1[0-2]|[1-9])\s*(AM|PM)$/i,           // "9 AM", "12 PM"
-    /^(1[0-2]|[1-9]):00\s*(AM|PM)?$/i,       // "9:00 AM", "9:00"
-    /^(0?[0-9]|1[0-9]|2[0-3]):00$/,          // "09:00", "14:00" (24h)
-    /^(1[0-2]|[1-9])\s*[ap]$/i,              // "9a", "12p"
-  ];
 
   function parseTimeText(text) {
     text = text.trim();
@@ -49,7 +41,6 @@
       const meridiem = m[3]?.toUpperCase();
       if (meridiem === 'PM' && h !== 12) h += 12;
       if (meridiem === 'AM' && h === 12) h = 0;
-      // If no meridiem and hour <= 12, assume AM for morning, PM for afternoon context
       return h * 60 + mins;
     }
 
@@ -72,224 +63,231 @@
     return null;
   }
 
-  function findTimeLabels() {
-    const results = [];
-    const checked = new Set();
+  // Find the main calendar grid bounds (excluding sidebar, mini-calendar, toolbar)
+  function findGridBounds() {
+    // The main grid in Google Calendar week view is typically:
+    // - To the right of the sidebar (x > 250)
+    // - Below the toolbar (y > 150)
+    // - Contains the scrollable time grid
 
-    // Strategy 1: Look for elements with aria-hidden="true" containing time text
-    // (Google Calendar often uses these for the time axis)
-    document.querySelectorAll('[aria-hidden="true"]').forEach(el => {
-      const text = el.textContent?.trim();
-      if (!text || text.length > 10 || checked.has(el)) return;
-      checked.add(el);
-      const mins = parseTimeText(text);
-      if (mins !== null) {
-        const rect = el.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) {
-          results.push({ el, totalMinutes: mins, clientY: rect.top + rect.height / 2, text });
-        }
-      }
-    });
-
-    // Strategy 2: Look for any small leaf elements with time-like text
-    document.querySelectorAll('*').forEach(el => {
-      if (checked.has(el)) return;
-      if (el.children.length > 2) return;
-      const text = el.textContent?.trim();
-      if (!text || text.length > 10) return;
-
-      const mins = parseTimeText(text);
-      if (mins !== null) {
-        const rect = el.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0 && rect.width < 100) {
-          results.push({ el, totalMinutes: mins, clientY: rect.top + rect.height / 2, text });
-          checked.add(el);
-        }
-      }
-    });
-
-    // Strategy 3: Check data-time attributes
-    document.querySelectorAll('[data-time]').forEach(el => {
-      if (checked.has(el)) return;
-      const dataTime = el.getAttribute('data-time');
-      const mins = parseTimeText(dataTime);
-      if (mins !== null) {
-        const rect = el.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) {
-          results.push({ el, totalMinutes: mins, clientY: rect.top + rect.height / 2, text: dataTime });
-          checked.add(el);
-        }
-      }
-    });
-
-    // Sort by Y position
-    results.sort((a, b) => a.clientY - b.clientY);
-
-    // Deduplicate: keep only one label per hour, prefer ones on the left side
-    const byHour = new Map();
-    for (const r of results) {
-      const hour = Math.floor(r.totalMinutes / 60);
-      const existing = byHour.get(hour);
-      if (!existing) {
-        byHour.set(hour, r);
-      } else {
-        // Prefer element further to the left (time axis)
-        const existingX = existing.el.getBoundingClientRect().left;
-        const newX = r.el.getBoundingClientRect().left;
-        if (newX < existingX) {
-          byHour.set(hour, r);
-        }
-      }
-    }
-
-    const dedupedResults = Array.from(byHour.values()).sort((a, b) => a.clientY - b.clientY);
-    log('Found time labels:', dedupedResults.map(r => ({ text: r.text, mins: r.totalMinutes, y: r.clientY })));
-    return dedupedResults;
-  }
-
-  function findScrollContainer() {
-    // Strategy 1: Find from time labels
-    const labels = findTimeLabels();
-    if (labels.length > 0) {
-      let el = labels[0].el.parentElement;
-      while (el && el !== document.body) {
-        const s = getComputedStyle(el);
-        const isScrollable = s.overflowY === 'auto' || s.overflowY === 'scroll';
-        const rect = el.getBoundingClientRect();
-        if (isScrollable && rect.width > 200 && rect.height > 200) {
-          log('Found scroll container via time labels:', el);
-          return el;
-        }
-        el = el.parentElement;
-      }
-    }
-
-    // Strategy 2: Look for the main calendar grid area by role
-    const mainGrid = document.querySelector('[role="main"] [role="grid"]');
-    if (mainGrid) {
-      let el = mainGrid;
-      while (el && el !== document.body) {
-        const s = getComputedStyle(el);
-        const isScrollable = s.overflowY === 'auto' || s.overflowY === 'scroll';
-        const rect = el.getBoundingClientRect();
-        if (isScrollable && rect.width > 200 && rect.height > 200) {
-          log('Found scroll container via role grid:', el);
-          return el;
-        }
-        el = el.parentElement;
-      }
-    }
-
-    // Strategy 3: Find the largest scrollable container in the page
-    let best = null;
-    let bestArea = 0;
-    document.querySelectorAll('*').forEach(el => {
-      const s = getComputedStyle(el);
-      if (s.overflowY !== 'auto' && s.overflowY !== 'scroll') return;
-      const rect = el.getBoundingClientRect();
-      if (rect.width < 300 || rect.height < 300) return;
-      const area = rect.width * rect.height;
-      if (area > bestArea) {
-        bestArea = area;
-        best = el;
-      }
-    });
-    if (best) {
-      log('Found scroll container via largest scrollable:', best);
-      return best;
-    }
-
-    // Strategy 4: Just use the main content area
+    // Look for role="main" which contains the calendar grid
     const main = document.querySelector('[role="main"]');
     if (main) {
       const rect = main.getBoundingClientRect();
-      if (rect.width > 200 && rect.height > 200) {
-        log('Using role=main as container');
-        return main;
+      // The time column is about 60-80px wide on the left of main
+      const timeColWidth = 80;
+      return {
+        top: rect.top,
+        left: rect.left + timeColWidth,
+        width: rect.width - timeColWidth,
+        height: rect.height,
+        fullLeft: rect.left, // Include time column for scroll container
+      };
+    }
+
+    // Fallback: use viewport minus estimated sidebar
+    return {
+      top: 150,
+      left: 300,
+      width: window.innerWidth - 300,
+      height: window.innerHeight - 150,
+      fullLeft: 250,
+    };
+  }
+
+  function findTimeLabels() {
+    const gridBounds = findGridBounds();
+    const results = [];
+    const checked = new Set();
+
+    // Only look for time labels near the left edge of the main grid
+    // (the time axis is typically at x = gridBounds.fullLeft to gridBounds.left)
+    const minX = gridBounds.fullLeft - 50;
+    const maxX = gridBounds.left + 50;
+
+    const checkElement = (el, text) => {
+      if (checked.has(el)) return;
+      const mins = parseTimeText(text);
+      if (mins === null) return;
+
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return;
+
+      // Filter: must be in the time axis area (left side of main grid)
+      if (rect.left < minX || rect.left > maxX) return;
+      // Filter: must be below toolbar
+      if (rect.top < 100) return;
+
+      results.push({ el, totalMinutes: mins, clientY: rect.top + rect.height / 2, text });
+      checked.add(el);
+    };
+
+    // Strategy 1: aria-hidden elements (Google Calendar uses these)
+    document.querySelectorAll('[aria-hidden="true"]').forEach(el => {
+      const text = el.textContent?.trim();
+      if (text && text.length <= 10) checkElement(el, text);
+    });
+
+    // Strategy 2: data-time attributes
+    document.querySelectorAll('[data-time]').forEach(el => {
+      checkElement(el, el.getAttribute('data-time'));
+    });
+
+    // Strategy 3: small leaf elements with time text
+    document.querySelectorAll('*').forEach(el => {
+      if (el.children.length > 2) return;
+      const text = el.textContent?.trim();
+      if (text && text.length <= 10) checkElement(el, text);
+    });
+
+    // Sort by Y position and deduplicate by hour
+    results.sort((a, b) => a.clientY - b.clientY);
+
+    const byHour = new Map();
+    for (const r of results) {
+      const hour = Math.floor(r.totalMinutes / 60);
+      if (!byHour.has(hour)) {
+        byHour.set(hour, r);
       }
     }
 
-    log('Could not find scroll container, will use viewport fallback');
+    const final = Array.from(byHour.values()).sort((a, b) => a.clientY - b.clientY);
+    log('Found time labels:', final.length, final.slice(0, 3).map(r => ({ text: r.text, y: Math.round(r.clientY) })));
+    return final;
+  }
+
+  function findScrollContainer() {
+    const gridBounds = findGridBounds();
+
+    // Find a scrollable container that:
+    // 1. Is in the main grid area (not sidebar)
+    // 2. Is tall enough to hold the time grid (> 400px)
+    // 3. Has overflow-y: auto or scroll
+
+    let best = null;
+    let bestScore = 0;
+
+    document.querySelectorAll('*').forEach(el => {
+      const s = getComputedStyle(el);
+      if (s.overflowY !== 'auto' && s.overflowY !== 'scroll') return;
+
+      const rect = el.getBoundingClientRect();
+
+      // Must be reasonably sized
+      if (rect.width < 300 || rect.height < 400) return;
+
+      // Must be in the main area (not the left sidebar)
+      if (rect.left < 200) return;
+
+      // Score by area, preferring taller containers
+      const score = rect.width * rect.height + rect.height * 100;
+      if (score > bestScore) {
+        bestScore = score;
+        best = el;
+      }
+    });
+
+    if (best) {
+      const rect = best.getBoundingClientRect();
+      log('Found scroll container:', { x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) });
+      return best;
+    }
+
+    // Fallback: use role="main"
+    const main = document.querySelector('[role="main"]');
+    if (main) {
+      log('Using role=main as scroll container');
+      return main;
+    }
+
+    log('No scroll container found');
     return null;
   }
 
   function findDayColumns() {
+    const gridBounds = findGridBounds();
     const cols = [];
 
-    // Strategy 1: role="columnheader" elements
+    // Strategy 1: role="columnheader" elements in the main grid area
     document.querySelectorAll('[role="columnheader"]').forEach(el => {
       const rect = el.getBoundingClientRect();
-      if (rect.width < 30) return;
+
+      // Filter: must be in main grid area (not mini-calendar)
+      if (rect.left < gridBounds.left - 20) return;
+      // Filter: must have reasonable width for a day column (> 60px)
+      if (rect.width < 60) return;
+
       const date = extractDate(el);
       if (date) cols.push({ clientX: rect.left, width: rect.width, date });
     });
-    if (cols.length) {
+
+    if (cols.length >= 1 && cols.length <= 7) {
       log('Found day columns via columnheader:', cols.length);
-      return cols;
+      return cols.sort((a, b) => a.clientX - b.clientX);
     }
 
-    // Strategy 2: elements with data-datekey / data-date
+    // Strategy 2: data-datekey/data-date elements in main grid area
+    const dateCols = [];
     document.querySelectorAll('[data-datekey],[data-date]').forEach(el => {
       const key = el.getAttribute('data-datekey') || el.getAttribute('data-date');
       const m = key && key.match(/(\d{4})-?(\d{2})-?(\d{2})/);
       if (!m) return;
+
       const rect = el.getBoundingClientRect();
-      if (rect.width < 30) return;
-      cols.push({
+
+      // Filter: must be in main grid area
+      if (rect.left < gridBounds.left - 20) return;
+      // Filter: must have reasonable width (> 60px to exclude mini-cal)
+      if (rect.width < 60) return;
+      // Filter: must be near top (header row)
+      if (rect.top > 250) return;
+
+      dateCols.push({
         clientX: rect.left,
         width: rect.width,
         date: new Date(+m[1], +m[2] - 1, +m[3]),
       });
     });
-    if (cols.length) {
-      log('Found day columns via data attributes:', cols.length);
-      return cols;
+
+    if (dateCols.length >= 1 && dateCols.length <= 7) {
+      log('Found day columns via data attributes:', dateCols.length);
+      return dateCols.sort((a, b) => a.clientX - b.clientX);
     }
 
-    // Strategy 3: Create synthetic columns based on visible grid
-    // If in week view, assume 7 columns; if day view, 1 column
-    const container = state.scrollContainer;
-    if (container) {
-      const rect = container.getBoundingClientRect();
-      const today = new Date();
-      const dayOfWeek = today.getDay(); // 0 = Sunday
+    // Strategy 3: Create synthetic columns
+    log('Creating synthetic day columns');
+    const container = findScrollContainer();
+    const rect = container ? container.getBoundingClientRect() : gridBounds;
 
-      // Assume week view with time column on left (~60px)
-      const timeColWidth = 60;
-      const gridWidth = rect.width - timeColWidth;
-      const numCols = 7; // week view
-      const colWidth = gridWidth / numCols;
+    const today = new Date();
+    const dayOfWeek = today.getDay();
+    const numCols = 7;
+    const colWidth = rect.width / numCols;
 
-      for (let i = 0; i < numCols; i++) {
-        const date = new Date(today);
-        date.setDate(today.getDate() - dayOfWeek + i);
-        cols.push({
-          clientX: rect.left + timeColWidth + i * colWidth,
-          width: colWidth,
-          date,
-        });
-      }
-      log('Created synthetic day columns:', cols.length);
+    for (let i = 0; i < numCols; i++) {
+      const date = new Date(today);
+      date.setDate(today.getDate() - dayOfWeek + i);
+      cols.push({
+        clientX: rect.left + i * colWidth,
+        width: colWidth,
+        date,
+      });
     }
 
     return cols;
   }
 
   function extractDate(el) {
-    // data attribute
     const key = el.getAttribute('data-datekey') || el.getAttribute('data-date');
     if (key) {
       const m = key.match(/(\d{4})-?(\d{2})-?(\d{2})/);
       if (m) return new Date(+m[1], +m[2] - 1, +m[3]);
     }
 
-    // aria-label with full date
     const label = el.getAttribute('aria-label') || '';
-    // Try parsing as date string
     const dateFromLabel = new Date(label);
     if (!isNaN(dateFromLabel.getTime())) return dateFromLabel;
 
-    // Look for day number
     const numM = (el.textContent || '').match(/\b(\d{1,2})\b/);
     if (numM) {
       const day = parseInt(numM[1], 10);
@@ -306,9 +304,11 @@
   // ── Calibration ──────────────────────────────────────────────────
 
   function calibrate() {
+    state.gridBounds = findGridBounds();
     const labels = findTimeLabels();
 
     if (labels.length >= 2) {
+      // Calculate pixels per minute from consecutive labels
       const samples = [];
       for (let i = 1; i < labels.length; i++) {
         const dm = labels[i].totalMinutes - labels[i - 1].totalMinutes;
@@ -318,38 +318,35 @@
       if (samples.length > 0) {
         const pxPerMin = samples.reduce((a, b) => a + b, 0) / samples.length;
         state.timeAxis = { labels, pxPerMin };
-        log('Calibrated time axis:', { labelCount: labels.length, pxPerMin });
+        log('Calibrated time axis:', { labelCount: labels.length, pxPerMin: pxPerMin.toFixed(2) });
       }
     }
 
-    // Fallback: use default pixels-per-minute based on typical calendar
+    // Fallback: use typical Google Calendar ratio (~0.8 px/min)
     if (!state.timeAxis) {
-      // Typical calendar: ~48px per hour = 0.8 px/min
-      // Create synthetic labels for reference
-      const container = state.scrollContainer;
-      if (container) {
-        const rect = container.getBoundingClientRect();
-        const scrollHeight = container.scrollHeight || rect.height;
-        // Assume 24 hours visible in scrollHeight
-        const pxPerMin = scrollHeight / (24 * 60);
-        const syntheticLabels = [];
-        for (let h = 0; h < 24; h++) {
-          syntheticLabels.push({
-            totalMinutes: h * 60,
-            clientY: rect.top + h * 60 * pxPerMin - (container.scrollTop || 0),
-          });
-        }
-        state.timeAxis = { labels: syntheticLabels, pxPerMin };
-        log('Using fallback time axis:', { pxPerMin });
+      const container = findScrollContainer();
+      const height = container ? container.scrollHeight : 1200;
+      const pxPerMin = height / (24 * 60);
+
+      // Create synthetic labels
+      const topY = state.gridBounds?.top || 200;
+      const syntheticLabels = [];
+      for (let h = 0; h < 24; h++) {
+        syntheticLabels.push({
+          totalMinutes: h * 60,
+          clientY: topY + h * 60 * pxPerMin,
+        });
       }
+      state.timeAxis = { labels: syntheticLabels, pxPerMin };
+      log('Using fallback time axis:', { pxPerMin: pxPerMin.toFixed(2) });
     }
 
     state.dayColumns = findDayColumns();
-    return !!state.timeAxis;
+    return true;
   }
 
   function getTimeFromY(clientY) {
-    if (!state.timeAxis) return 9 * 60; // Default to 9 AM
+    if (!state.timeAxis) return 9 * 60;
 
     const { labels, pxPerMin } = state.timeAxis;
 
@@ -381,7 +378,6 @@
     const found = cols.find(c => clientX >= c.clientX && clientX < c.clientX + c.width);
     if (found) return found.date;
 
-    // Return nearest column
     return cols.reduce((a, b) => {
       const aMid = a.clientX + a.width / 2;
       const bMid = b.clientX + b.width / 2;
@@ -392,7 +388,7 @@
   // ── Overlay ──────────────────────────────────────────────────────
 
   function buildOverlay() {
-    state.scrollContainer = findScrollContainer();
+    const container = findScrollContainer();
 
     const overlay = document.createElement('div');
     overlay.id = 'csp-capture-overlay';
@@ -406,6 +402,7 @@
 
     document.body.appendChild(overlay);
     state.overlay = overlay;
+    state.scrollContainer = container;
     positionOverlay();
     return true;
   }
@@ -413,16 +410,19 @@
   function positionOverlay() {
     if (!state.overlay) return;
 
+    const container = state.scrollContainer;
     let rect;
-    if (state.scrollContainer) {
-      rect = state.scrollContainer.getBoundingClientRect();
+
+    if (container) {
+      rect = container.getBoundingClientRect();
     } else {
-      // Fallback: cover most of viewport, leaving toolbar area
+      // Fallback based on grid bounds
+      const gb = state.gridBounds || findGridBounds();
       rect = {
-        top: 64, // Leave space for toolbar
-        left: 0,
-        width: window.innerWidth,
-        height: window.innerHeight - 64,
+        top: gb.top,
+        left: gb.fullLeft,
+        width: gb.width + (gb.left - gb.fullLeft),
+        height: gb.height,
       };
     }
 
@@ -434,12 +434,12 @@
       height: rect.height + 'px',
       zIndex: '999998',
       cursor: 'crosshair',
-      background: 'rgba(26, 115, 232, 0.03)',
-      border: '2px dashed rgba(26, 115, 232, 0.3)',
+      background: 'rgba(26, 115, 232, 0.02)',
+      border: '2px dashed rgba(26, 115, 232, 0.2)',
       boxSizing: 'border-box',
     });
 
-    log('Overlay positioned:', rect);
+    log('Overlay positioned:', { x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) });
   }
 
   // ── Mouse Handlers ───────────────────────────────────────────────
@@ -458,10 +458,9 @@
       endMin: startMin + 60,
       date,
       clientX: e.clientX,
-      moved: false,
     };
 
-    log('Drag started:', { startMin, date: date.toDateString() });
+    log('Drag started:', { time: fmtMin(startMin), date: date.toDateString() });
     renderPreview();
   }
 
@@ -470,7 +469,6 @@
     const newEnd = getTimeFromY(e.clientY);
     if (newEnd > state.drag.startMin) {
       state.drag.endMin = newEnd;
-      state.drag.moved = true;
     }
     state.drag.clientX = e.clientX;
     renderPreview();
@@ -478,7 +476,6 @@
 
   function onMouseup(e) {
     if (!state.drag) return;
-    log('Drag ended');
     commitDrag();
     state.drag = null;
   }
@@ -495,7 +492,10 @@
     if (state.scrollContainer) {
       state.scrollContainer.scrollTop += e.deltaY;
     }
-    requestAnimationFrame(refreshHighlights);
+    requestAnimationFrame(() => {
+      calibrate();
+      refreshHighlights();
+    });
   }
 
   // ── Drag Preview ─────────────────────────────────────────────────
@@ -546,8 +546,6 @@
     if (!state.drag) return;
 
     let { startMin, endMin, date } = state.drag;
-
-    // If barely dragged, treat as a 30-min click
     if (endMin - startMin < 15) endMin = startMin + 30;
 
     const startTime = minsToTime(startMin);
@@ -563,8 +561,6 @@
       endTimeString: fmtTime(endTime.hours, endTime.minutes),
     };
 
-    log('Committing slot:', slot.id);
-
     const idx = state.slots.findIndex(s => s.id === slot.id);
     if (idx !== -1) {
       state.slots.splice(idx, 1);
@@ -573,9 +569,7 @@
       state.slots.push(slot);
       state.slots.sort((a, b) => {
         const dd = a.date - b.date;
-        return dd !== 0 ? dd :
-          (a.startTime.hours * 60 + a.startTime.minutes) -
-          (b.startTime.hours * 60 + b.startTime.minutes);
+        return dd !== 0 ? dd : (a.startTime.hours * 60 + a.startTime.minutes) - (b.startTime.hours * 60 + b.startTime.minutes);
       });
       addHighlight(slot);
     }
@@ -610,7 +604,7 @@
     const height = Math.max(24, endY - startY);
 
     const cols = state.dayColumns || [];
-    let left = 60, width = 100;
+    let left = 10, width = 100;
 
     if (cols.length > 0 && date) {
       const col = cols.find(c =>
@@ -630,7 +624,6 @@
   function addHighlight(slot) {
     if (!state.overlay) return;
 
-    calibrate();
     const startMin = slot.startTime.hours * 60 + slot.startTime.minutes;
     const endMin = slot.endTime.hours * 60 + slot.endTime.minutes;
     const pos = getSlotPosition(slot.date, startMin, endMin);
@@ -669,8 +662,7 @@
   }
 
   function refreshHighlights() {
-    if (!state.overlay || !state.timeAxis) return;
-    calibrate();
+    if (!state.overlay) return;
 
     state.highlights.forEach((el, slotId) => {
       const slot = state.slots.find(s => s.id === slotId);
@@ -711,8 +703,7 @@
   }
 
   function notify() {
-    chrome.runtime.sendMessage({ type: 'SLOTS_UPDATED', slots: state.slots })
-      .catch(() => {});
+    chrome.runtime.sendMessage({ type: 'SLOTS_UPDATED', slots: state.slots }).catch(() => {});
   }
 
   // ── Enable / Disable ─────────────────────────────────────────────
@@ -720,14 +711,12 @@
   function enable() {
     if (state.isActive) return;
 
-    calibrate(); // Try to calibrate, but continue even if it fails
+    calibrate();
     buildOverlay();
     state.isActive = true;
 
-    // Re-render any previously selected slots
     state.slots.forEach(slot => addHighlight(slot));
     document.body.classList.add('csp-selection-active');
-
     log('Selection mode enabled');
   }
 
@@ -773,18 +762,21 @@
     });
 
     window.addEventListener('resize', () => {
-      positionOverlay();
-      requestAnimationFrame(refreshHighlights);
+      if (state.isActive) {
+        calibrate();
+        positionOverlay();
+        refreshHighlights();
+      }
     });
 
-    // Recalibrate when Google Calendar navigates (SPA)
+    // Recalibrate on SPA navigation
     let lastUrl = location.href;
     new MutationObserver(() => {
       if (location.href !== lastUrl) {
         lastUrl = location.href;
         setTimeout(() => {
-          calibrate();
           if (state.isActive) {
+            calibrate();
             positionOverlay();
             refreshHighlights();
           }
