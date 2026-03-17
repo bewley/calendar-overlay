@@ -4,67 +4,212 @@
 (function () {
   'use strict';
 
+  const DEBUG = true;
+  function log(...args) { if (DEBUG) console.log('[CSP]', ...args); }
+
   const state = {
     slots: [],
     isActive: false,
-    drag: null,          // { startMin, endMin, date, clientX }
-    overlay: null,       // the fixed capture div
+    drag: null,
+    overlay: null,
     scrollContainer: null,
-    timeAxis: null,      // { labels:[{clientY, totalMinutes}], pxPerMin }
-    dayColumns: null,    // [{clientX, width, date}]
-    highlights: new Map(), // slotId -> HTMLElement
+    timeAxis: null,
+    dayColumns: null,
+    highlights: new Map(),
   };
 
   // ── DOM Detection ────────────────────────────────────────────────
 
-  // Walk ALL elements looking for short text matching "1 AM", "2 PM", etc.
-  function findTimeLabels() {
-    const pattern = /^(1[0-2]|[1-9])\s*(AM|PM)$/i;
-    const results = [];
+  // Multiple patterns to match time labels in Google Calendar
+  const TIME_PATTERNS = [
+    /^(1[0-2]|[1-9])\s*(AM|PM)$/i,           // "9 AM", "12 PM"
+    /^(1[0-2]|[1-9]):00\s*(AM|PM)?$/i,       // "9:00 AM", "9:00"
+    /^(0?[0-9]|1[0-9]|2[0-3]):00$/,          // "09:00", "14:00" (24h)
+    /^(1[0-2]|[1-9])\s*[ap]$/i,              // "9a", "12p"
+  ];
 
-    document.querySelectorAll('*').forEach(el => {
-      // Only look at leaf-ish nodes
-      if (el.children.length > 2) return;
-      const text = (el.innerText || el.textContent || '').trim();
-      if (!pattern.test(text)) return;
-      const rect = el.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) return;
+  function parseTimeText(text) {
+    text = text.trim();
 
-      const m = text.match(pattern);
+    // Pattern: "9 AM", "12 PM", "9AM"
+    let m = text.match(/^(1[0-2]|[1-9])\s*(AM|PM)$/i);
+    if (m) {
       let h = parseInt(m[1], 10);
       const pm = m[2].toUpperCase() === 'PM';
       if (pm && h !== 12) h += 12;
       if (!pm && h === 12) h = 0;
+      return h * 60;
+    }
 
-      results.push({ el, totalMinutes: h * 60, clientY: rect.top + rect.height / 2 });
+    // Pattern: "9:00 AM", "12:00 PM", "9:00", "9:00am"
+    m = text.match(/^(1[0-2]|[1-9]):(\d{2})\s*(AM|PM)?$/i);
+    if (m) {
+      let h = parseInt(m[1], 10);
+      const mins = parseInt(m[2], 10);
+      const meridiem = m[3]?.toUpperCase();
+      if (meridiem === 'PM' && h !== 12) h += 12;
+      if (meridiem === 'AM' && h === 12) h = 0;
+      // If no meridiem and hour <= 12, assume AM for morning, PM for afternoon context
+      return h * 60 + mins;
+    }
+
+    // Pattern: "09:00", "14:00" (24-hour)
+    m = text.match(/^(0?[0-9]|1[0-9]|2[0-3]):(\d{2})$/);
+    if (m) {
+      return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+    }
+
+    // Pattern: "9a", "12p"
+    m = text.match(/^(1[0-2]|[1-9])\s*([ap])$/i);
+    if (m) {
+      let h = parseInt(m[1], 10);
+      const pm = m[2].toLowerCase() === 'p';
+      if (pm && h !== 12) h += 12;
+      if (!pm && h === 12) h = 0;
+      return h * 60;
+    }
+
+    return null;
+  }
+
+  function findTimeLabels() {
+    const results = [];
+    const checked = new Set();
+
+    // Strategy 1: Look for elements with aria-hidden="true" containing time text
+    // (Google Calendar often uses these for the time axis)
+    document.querySelectorAll('[aria-hidden="true"]').forEach(el => {
+      const text = el.textContent?.trim();
+      if (!text || text.length > 10 || checked.has(el)) return;
+      checked.add(el);
+      const mins = parseTimeText(text);
+      if (mins !== null) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          results.push({ el, totalMinutes: mins, clientY: rect.top + rect.height / 2, text });
+        }
+      }
     });
 
+    // Strategy 2: Look for any small leaf elements with time-like text
+    document.querySelectorAll('*').forEach(el => {
+      if (checked.has(el)) return;
+      if (el.children.length > 2) return;
+      const text = el.textContent?.trim();
+      if (!text || text.length > 10) return;
+
+      const mins = parseTimeText(text);
+      if (mins !== null) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0 && rect.width < 100) {
+          results.push({ el, totalMinutes: mins, clientY: rect.top + rect.height / 2, text });
+          checked.add(el);
+        }
+      }
+    });
+
+    // Strategy 3: Check data-time attributes
+    document.querySelectorAll('[data-time]').forEach(el => {
+      if (checked.has(el)) return;
+      const dataTime = el.getAttribute('data-time');
+      const mins = parseTimeText(dataTime);
+      if (mins !== null) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          results.push({ el, totalMinutes: mins, clientY: rect.top + rect.height / 2, text: dataTime });
+          checked.add(el);
+        }
+      }
+    });
+
+    // Sort by Y position
     results.sort((a, b) => a.clientY - b.clientY);
-    // Deduplicate by totalMinutes (keep first occurrence per hour)
-    const seen = new Set();
-    return results.filter(r => {
-      if (seen.has(r.totalMinutes)) return false;
-      seen.add(r.totalMinutes);
-      return true;
-    });
+
+    // Deduplicate: keep only one label per hour, prefer ones on the left side
+    const byHour = new Map();
+    for (const r of results) {
+      const hour = Math.floor(r.totalMinutes / 60);
+      const existing = byHour.get(hour);
+      if (!existing) {
+        byHour.set(hour, r);
+      } else {
+        // Prefer element further to the left (time axis)
+        const existingX = existing.el.getBoundingClientRect().left;
+        const newX = r.el.getBoundingClientRect().left;
+        if (newX < existingX) {
+          byHour.set(hour, r);
+        }
+      }
+    }
+
+    const dedupedResults = Array.from(byHour.values()).sort((a, b) => a.clientY - b.clientY);
+    log('Found time labels:', dedupedResults.map(r => ({ text: r.text, mins: r.totalMinutes, y: r.clientY })));
+    return dedupedResults;
   }
 
   function findScrollContainer() {
+    // Strategy 1: Find from time labels
     const labels = findTimeLabels();
-    if (!labels.length) return null;
-
-    // Walk up from the first label to find a scrollable ancestor that is
-    // wider than just the time column
-    let el = labels[0].el.parentElement;
-    while (el && el !== document.body) {
-      const s = getComputedStyle(el);
-      const isScrollable = s.overflowY === 'auto' || s.overflowY === 'scroll';
-      const rect = el.getBoundingClientRect();
-      if (isScrollable && rect.width > 200 && rect.height > 200) {
-        return el;
+    if (labels.length > 0) {
+      let el = labels[0].el.parentElement;
+      while (el && el !== document.body) {
+        const s = getComputedStyle(el);
+        const isScrollable = s.overflowY === 'auto' || s.overflowY === 'scroll';
+        const rect = el.getBoundingClientRect();
+        if (isScrollable && rect.width > 200 && rect.height > 200) {
+          log('Found scroll container via time labels:', el);
+          return el;
+        }
+        el = el.parentElement;
       }
-      el = el.parentElement;
     }
+
+    // Strategy 2: Look for the main calendar grid area by role
+    const mainGrid = document.querySelector('[role="main"] [role="grid"]');
+    if (mainGrid) {
+      let el = mainGrid;
+      while (el && el !== document.body) {
+        const s = getComputedStyle(el);
+        const isScrollable = s.overflowY === 'auto' || s.overflowY === 'scroll';
+        const rect = el.getBoundingClientRect();
+        if (isScrollable && rect.width > 200 && rect.height > 200) {
+          log('Found scroll container via role grid:', el);
+          return el;
+        }
+        el = el.parentElement;
+      }
+    }
+
+    // Strategy 3: Find the largest scrollable container in the page
+    let best = null;
+    let bestArea = 0;
+    document.querySelectorAll('*').forEach(el => {
+      const s = getComputedStyle(el);
+      if (s.overflowY !== 'auto' && s.overflowY !== 'scroll') return;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 300 || rect.height < 300) return;
+      const area = rect.width * rect.height;
+      if (area > bestArea) {
+        bestArea = area;
+        best = el;
+      }
+    });
+    if (best) {
+      log('Found scroll container via largest scrollable:', best);
+      return best;
+    }
+
+    // Strategy 4: Just use the main content area
+    const main = document.querySelector('[role="main"]');
+    if (main) {
+      const rect = main.getBoundingClientRect();
+      if (rect.width > 200 && rect.height > 200) {
+        log('Using role=main as container');
+        return main;
+      }
+    }
+
+    log('Could not find scroll container, will use viewport fallback');
     return null;
   }
 
@@ -74,11 +219,14 @@
     // Strategy 1: role="columnheader" elements
     document.querySelectorAll('[role="columnheader"]').forEach(el => {
       const rect = el.getBoundingClientRect();
-      if (rect.width < 30) return; // skip narrow time-axis cell
+      if (rect.width < 30) return;
       const date = extractDate(el);
       if (date) cols.push({ clientX: rect.left, width: rect.width, date });
     });
-    if (cols.length) return cols;
+    if (cols.length) {
+      log('Found day columns via columnheader:', cols.length);
+      return cols;
+    }
 
     // Strategy 2: elements with data-datekey / data-date
     document.querySelectorAll('[data-datekey],[data-date]').forEach(el => {
@@ -93,6 +241,37 @@
         date: new Date(+m[1], +m[2] - 1, +m[3]),
       });
     });
+    if (cols.length) {
+      log('Found day columns via data attributes:', cols.length);
+      return cols;
+    }
+
+    // Strategy 3: Create synthetic columns based on visible grid
+    // If in week view, assume 7 columns; if day view, 1 column
+    const container = state.scrollContainer;
+    if (container) {
+      const rect = container.getBoundingClientRect();
+      const today = new Date();
+      const dayOfWeek = today.getDay(); // 0 = Sunday
+
+      // Assume week view with time column on left (~60px)
+      const timeColWidth = 60;
+      const gridWidth = rect.width - timeColWidth;
+      const numCols = 7; // week view
+      const colWidth = gridWidth / numCols;
+
+      for (let i = 0; i < numCols; i++) {
+        const date = new Date(today);
+        date.setDate(today.getDate() - dayOfWeek + i);
+        cols.push({
+          clientX: rect.left + timeColWidth + i * colWidth,
+          width: colWidth,
+          date,
+        });
+      }
+      log('Created synthetic day columns:', cols.length);
+    }
+
     return cols;
   }
 
@@ -103,9 +282,15 @@
       const m = key.match(/(\d{4})-?(\d{2})-?(\d{2})/);
       if (m) return new Date(+m[1], +m[2] - 1, +m[3]);
     }
-    // aria-label with day number
-    const label = el.getAttribute('aria-label') || el.textContent || '';
-    const numM = label.match(/\b(\d{1,2})\b/);
+
+    // aria-label with full date
+    const label = el.getAttribute('aria-label') || '';
+    // Try parsing as date string
+    const dateFromLabel = new Date(label);
+    if (!isNaN(dateFromLabel.getTime())) return dateFromLabel;
+
+    // Look for day number
+    const numM = (el.textContent || '').match(/\b(\d{1,2})\b/);
     if (numM) {
       const day = parseInt(numM[1], 10);
       const today = new Date();
@@ -122,35 +307,66 @@
 
   function calibrate() {
     const labels = findTimeLabels();
-    if (labels.length < 2) return false;
 
-    const samples = [];
-    for (let i = 1; i < labels.length; i++) {
-      const dm = labels[i].totalMinutes - labels[i - 1].totalMinutes;
-      const dy = labels[i].clientY - labels[i - 1].clientY;
-      if (dm > 0 && dy > 0) samples.push(dy / dm);
+    if (labels.length >= 2) {
+      const samples = [];
+      for (let i = 1; i < labels.length; i++) {
+        const dm = labels[i].totalMinutes - labels[i - 1].totalMinutes;
+        const dy = labels[i].clientY - labels[i - 1].clientY;
+        if (dm > 0 && dy > 0) samples.push(dy / dm);
+      }
+      if (samples.length > 0) {
+        const pxPerMin = samples.reduce((a, b) => a + b, 0) / samples.length;
+        state.timeAxis = { labels, pxPerMin };
+        log('Calibrated time axis:', { labelCount: labels.length, pxPerMin });
+      }
     }
-    const pxPerMin = samples.reduce((a, b) => a + b, 0) / samples.length;
 
-    state.timeAxis = { labels, pxPerMin };
+    // Fallback: use default pixels-per-minute based on typical calendar
+    if (!state.timeAxis) {
+      // Typical calendar: ~48px per hour = 0.8 px/min
+      // Create synthetic labels for reference
+      const container = state.scrollContainer;
+      if (container) {
+        const rect = container.getBoundingClientRect();
+        const scrollHeight = container.scrollHeight || rect.height;
+        // Assume 24 hours visible in scrollHeight
+        const pxPerMin = scrollHeight / (24 * 60);
+        const syntheticLabels = [];
+        for (let h = 0; h < 24; h++) {
+          syntheticLabels.push({
+            totalMinutes: h * 60,
+            clientY: rect.top + h * 60 * pxPerMin - (container.scrollTop || 0),
+          });
+        }
+        state.timeAxis = { labels: syntheticLabels, pxPerMin };
+        log('Using fallback time axis:', { pxPerMin });
+      }
+    }
+
     state.dayColumns = findDayColumns();
-    return true;
+    return !!state.timeAxis;
   }
 
   function getTimeFromY(clientY) {
+    if (!state.timeAxis) return 9 * 60; // Default to 9 AM
+
     const { labels, pxPerMin } = state.timeAxis;
+
     // Find nearest label
     let best = labels[0];
     for (const l of labels) {
       if (Math.abs(l.clientY - clientY) < Math.abs(best.clientY - clientY)) best = l;
     }
+
     const deltaMins = (clientY - best.clientY) / pxPerMin;
-    // Snap to 15-minute intervals
     const snapped = Math.round(deltaMins / 15) * 15;
     return Math.max(0, Math.min(23 * 60 + 45, best.totalMinutes + snapped));
   }
 
   function getClientYFromTime(totalMinutes) {
+    if (!state.timeAxis) return 200;
+
     const { labels, pxPerMin } = state.timeAxis;
     const best = labels.reduce((a, b) =>
       Math.abs(b.totalMinutes - totalMinutes) < Math.abs(a.totalMinutes - totalMinutes) ? b : a
@@ -160,25 +376,23 @@
 
   function getDateFromX(clientX) {
     const cols = state.dayColumns;
-    if (!cols.length) return new Date();
-    return (
-      cols.find(c => clientX >= c.clientX && clientX < c.clientX + c.width) ||
-      cols.reduce((a, b) => {
-        const aMid = a.clientX + a.width / 2;
-        const bMid = b.clientX + b.width / 2;
-        return Math.abs(bMid - clientX) < Math.abs(aMid - clientX) ? b : a;
-      })
-    ).date;
+    if (!cols || !cols.length) return new Date();
+
+    const found = cols.find(c => clientX >= c.clientX && clientX < c.clientX + c.width);
+    if (found) return found.date;
+
+    // Return nearest column
+    return cols.reduce((a, b) => {
+      const aMid = a.clientX + a.width / 2;
+      const bMid = b.clientX + b.width / 2;
+      return Math.abs(bMid - clientX) < Math.abs(aMid - clientX) ? b : a;
+    }).date;
   }
 
   // ── Overlay ──────────────────────────────────────────────────────
 
   function buildOverlay() {
     state.scrollContainer = findScrollContainer();
-    if (!state.scrollContainer) {
-      console.warn('CSP: could not find scroll container');
-      return false;
-    }
 
     const overlay = document.createElement('div');
     overlay.id = 'csp-capture-overlay';
@@ -197,8 +411,21 @@
   }
 
   function positionOverlay() {
-    if (!state.overlay || !state.scrollContainer) return;
-    const rect = state.scrollContainer.getBoundingClientRect();
+    if (!state.overlay) return;
+
+    let rect;
+    if (state.scrollContainer) {
+      rect = state.scrollContainer.getBoundingClientRect();
+    } else {
+      // Fallback: cover most of viewport, leaving toolbar area
+      rect = {
+        top: 64, // Leave space for toolbar
+        left: 0,
+        width: window.innerWidth,
+        height: window.innerHeight - 64,
+      };
+    }
+
     Object.assign(state.overlay.style, {
       position: 'fixed',
       top: rect.top + 'px',
@@ -207,8 +434,12 @@
       height: rect.height + 'px',
       zIndex: '999998',
       cursor: 'crosshair',
-      background: 'transparent',
+      background: 'rgba(26, 115, 232, 0.03)',
+      border: '2px dashed rgba(26, 115, 232, 0.3)',
+      boxSizing: 'border-box',
     });
+
+    log('Overlay positioned:', rect);
   }
 
   // ── Mouse Handlers ───────────────────────────────────────────────
@@ -230,6 +461,7 @@
       moved: false,
     };
 
+    log('Drag started:', { startMin, date: date.toDateString() });
     renderPreview();
   }
 
@@ -246,6 +478,7 @@
 
   function onMouseup(e) {
     if (!state.drag) return;
+    log('Drag ended');
     commitDrag();
     state.drag = null;
   }
@@ -262,7 +495,6 @@
     if (state.scrollContainer) {
       state.scrollContainer.scrollTop += e.deltaY;
     }
-    // Refresh highlight positions after scroll
     requestAnimationFrame(refreshHighlights);
   }
 
@@ -282,7 +514,7 @@
         borderRadius: '4px',
         pointerEvents: 'none',
         padding: '3px 5px',
-        fontSize: '11px',
+        fontSize: '12px',
         fontWeight: '600',
         color: '#1a73e8',
         overflow: 'hidden',
@@ -298,7 +530,7 @@
       top: pos.top + 'px',
       left: pos.left + 'px',
       width: pos.width + 'px',
-      height: Math.max(18, pos.height) + 'px',
+      height: Math.max(24, pos.height) + 'px',
     });
     preview.textContent = `${fmtMin(state.drag.startMin)} – ${fmtMin(state.drag.endMin)}`;
   }
@@ -330,6 +562,8 @@
       startTimeString: fmtTime(startTime.hours, startTime.minutes),
       endTimeString: fmtTime(endTime.hours, endTime.minutes),
     };
+
+    log('Committing slot:', slot.id);
 
     const idx = state.slots.findIndex(s => s.id === slot.id);
     if (idx !== -1) {
@@ -368,23 +602,22 @@
   // ── Highlights ───────────────────────────────────────────────────
 
   function getSlotPosition(date, startMin, endMin) {
-    if (!state.timeAxis || !state.overlay) return null;
+    if (!state.overlay) return null;
+
     const overlayRect = state.overlay.getBoundingClientRect();
     const startY = getClientYFromTime(startMin) - overlayRect.top;
     const endY = getClientYFromTime(endMin) - overlayRect.top;
-    const height = Math.max(18, endY - startY);
+    const height = Math.max(24, endY - startY);
 
     const cols = state.dayColumns || [];
-    let left = 60, width = 80;
+    let left = 60, width = 100;
 
-    if (cols.length > 0) {
-      const col = date
-        ? cols.find(c =>
-            c.date.getFullYear() === date.getFullYear() &&
-            c.date.getMonth() === date.getMonth() &&
-            c.date.getDate() === date.getDate()
-          )
-        : null;
+    if (cols.length > 0 && date) {
+      const col = cols.find(c =>
+        c.date.getFullYear() === date.getFullYear() &&
+        c.date.getMonth() === date.getMonth() &&
+        c.date.getDate() === date.getDate()
+      );
       if (col) {
         left = col.clientX - overlayRect.left + 2;
         width = col.width - 4;
@@ -395,7 +628,7 @@
   }
 
   function addHighlight(slot) {
-    if (!state.overlay || !state.timeAxis) return;
+    if (!state.overlay) return;
 
     calibrate();
     const startMin = slot.startTime.hours * 60 + slot.startTime.minutes;
@@ -438,7 +671,6 @@
   function refreshHighlights() {
     if (!state.overlay || !state.timeAxis) return;
     calibrate();
-    const overlayRect = state.overlay.getBoundingClientRect();
 
     state.highlights.forEach((el, slotId) => {
       const slot = state.slots.find(s => s.id === slotId);
@@ -487,15 +719,16 @@
 
   function enable() {
     if (state.isActive) return;
-    if (!calibrate()) {
-      console.warn('CSP: Could not find time labels — are you in week/day view?');
-    }
-    if (!buildOverlay()) return;
+
+    calibrate(); // Try to calibrate, but continue even if it fails
+    buildOverlay();
     state.isActive = true;
 
     // Re-render any previously selected slots
     state.slots.forEach(slot => addHighlight(slot));
     document.body.classList.add('csp-selection-active');
+
+    log('Selection mode enabled');
   }
 
   function disable() {
@@ -507,6 +740,7 @@
     }
     state.highlights.clear();
     document.body.classList.remove('csp-selection-active');
+    log('Selection mode disabled');
   }
 
   // ── Init ─────────────────────────────────────────────────────────
@@ -558,7 +792,7 @@
       }
     }).observe(document.body, { childList: true, subtree: true });
 
-    console.log('Calendar Slots Picker ready');
+    log('Calendar Slots Picker ready');
   }
 
   if (document.readyState === 'loading') {
